@@ -1,24 +1,27 @@
-package socket.client;
+package com.wisdombud.alarmmgr.collection.service;
 
-
+import com.wisdombud.alarmmgr.collection.common.util.CommonUtil;
+import com.wisdombud.alarmmgr.collection.domain.acc.AlarmInfoCusin;
+import com.wisdombud.alarmmgr.collection.domain.acc.AlarmInfoCusinRepository;
+import com.wisdombud.alarmmgr.collection.domain.socketClient.AlarmInfo;
+import com.wisdombud.alarmmgr.collection.domain.socketClient.AlarmInfoRespository;
+import com.wisdombud.alarmmgr.collection.domain.socketClient.SocketServerInfo;
+import com.wisdombud.alarmmgr.collection.domain.socketClient.SourceInfo;
+import com.wisdombud.alarmmgr.collection.domain.socketServer.AlarmDataTest;
+import com.wisdombud.alarmmgr.collection.http.HttpUtils;
 import lombok.extern.slf4j.Slf4j;
 import net.sf.json.JSONObject;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
-import socket.*;
-import socket.httpUtil.HttpUtils;
-import socket.service.AlarmDataService;
-import socket.service.SourceInfoService;
-
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.*;
 import java.net.Socket;
 import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Random;
+import java.util.*;
 
+/**
+ * created by zsl
+ */
 @Service("socketClientService")
 @Slf4j
 public class SocketClientService {
@@ -30,12 +33,21 @@ public class SocketClientService {
     private AlarmDataService alarmDataService;
     @Autowired
     private SourceInfoService sourceInfoService;
+    @Autowired
+    RedisTemplate<String,String> redisTemplate;
+    @Autowired
+    private SocketServerInfoService socketServerInfoService;
 
     private static Integer reqId = 1;
+
+    List<AlarmInfo> alarmInfos = new ArrayList<AlarmInfo>();
+
+    List<AlarmInfoCusin> alarmInfoCusins = new ArrayList<AlarmInfoCusin>();
 
     //客户端发送请求
     public void send(String msg, Socket socket) {
         try {
+            System.out.println("ip地址"+socket.getInetAddress().getHostAddress());
             OutputStream outputStream = socket.getOutputStream();
             byte[] sendBytes = msg.getBytes("UTF-8");
             outputStream.write(sendBytes);
@@ -44,8 +56,9 @@ public class SocketClientService {
         }
     }
 
+    //客户端发送心跳
     public void heartBeat(Socket socket) throws Exception {
-        final OutputStream outputStream = socket.getOutputStream();
+        OutputStream outputStream = socket.getOutputStream();
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -57,37 +70,75 @@ public class SocketClientService {
                         Thread.sleep(60000L);
                     }
                 } catch (Exception e) {
-                    e.printStackTrace();
+                    System.out.println("socket is cloesed, stop send heartBeat");
                 }
             }
         }).start();
     }
 
     //接收服务端响应
-    public void receiveAlarmData(String msg, Socket socket) {
+    public void receiveAlarmData(String msg, Socket socket, SocketServerInfo socketServerInfo) {
         try {
             //登录请求
             send(msg, socket);
-
+            Thread.sleep(3000L);
             //心跳
             heartBeat(socket);
-            while (true) {
-                OutputStream outputStream = socket.getOutputStream();
-                Map<String, Integer> map = new HashMap<String, Integer>();
-                InputStream is = socket.getInputStream();
+            Thread.sleep(3000L);
+
+            //获取输出流
+            OutputStream outputStream = socket.getOutputStream();
+            //获取输入流
+            InputStream is = socket.getInputStream();
+
+            Map<String, Integer> map = new HashMap<String, Integer>();
+
+            boolean b = true;
+            while (b) {
+                //判断手动开关为离线，关闭socket
+                String unique = redisTemplate.boundValueOps(socketServerInfo.getUniqueKey() + "02").get();
+                if (unique.equals("0")){
+                    socketServerInfoService.close(socketServerInfo.getId());
+                    socketServerInfo.setCauseInfo("auto closed");
+                    socketServerInfoService.save(socketServerInfo);
+                    outputStream.write("close socket".getBytes());
+                    Thread.sleep(3000);
+                    b = false;
+                    outputStream.close();
+                    is.close();
+                    socket.close();
+                    break;
+                }
+
+
                 byte[] inputBytes = new byte[1024 * 8];
                 int len;
                 String s;
+
                 //监听输入流
                 while (is.available() != 0 && (len = is.read(inputBytes)) != -1) {
+                    //判断手动开关为离线，关闭socket
+                    String unique2 = redisTemplate.boundValueOps(socketServerInfo.getUniqueKey() + "02").get();
+                    if (unique2.equals("0")){
+                        socketServerInfoService.close(socketServerInfo.getId());
+                        socketServerInfo.setCauseInfo("auto closed");
+                        socketServerInfoService.save(socketServerInfo);
+                        outputStream.write("close  socket".getBytes());
+                        Thread.sleep(3000);
+                        b = false;
+                        outputStream.close();
+                        is.close();
+                        socket.close();
+                        break;
+                    }
+
                     //s为接受到的服务端的响应
                     s = new String(inputBytes, 0, len, "UTF-8");
-                    System.out.println("!!!!!!!" + s);
 
                     //如果登录失败继续发送登录请求
                     if(s.contains("ackLoginAlarm;result=fail")){
                         send(msg, socket);
-                    //包含realTimeAlarm为服务端发送的实时告警消息
+                        //包含realTimeAlarm为服务端发送的实时告警消息
                     }else if (s.contains("realTimeAlarm:")) {
                         String[] strs = s.split("realTimeAlarm:");
                         String string = strs[1];
@@ -143,10 +194,13 @@ public class SocketClientService {
             map.put("neuid",alarmDataTest.getNeUID());
             String result = HttpUtils.sendGet(url, map);
             System.out.println(result);
+            //这个地方记得把告警的departmentID、NAME存到CONF_SENSOR_TEMP里
         }
     }
 
+    //保存到数据库
     public void alarmDataSave(AlarmDataTest alarmDataTest) {
+
         AlarmInfo alarmInfo = new AlarmInfo();
         AlarmInfoCusin alarmInfoCusin = new AlarmInfoCusin();
 
@@ -165,50 +219,60 @@ public class SocketClientService {
             alarmInfo.setDictAlarmLevelValue(6110010000000001L);
             alarmInfoCusin.setAlarmStatus(1);
         }
-        alarmInfo.setFirstOccurTime(new SimpleDateFormat("yyyy-MM-dd  HH:mm:ss").format(new Date()));
-        alarmInfo.setCauseId(alarmDataTest.getSpecificProblemId() + new Random().nextInt(100));
-        alarmInfo.setCauseName(alarmDataTest.getSpecificProblem() + new Random().nextInt(100));
-        alarmInfo.setObjectId("test" + new Random().nextInt(1000));
-        alarmInfo.setObjectName("test" + new Random().nextInt(1000));
-        alarmInfo.setResName("test" + new Random().nextInt(1000));
-        alarmInfo.setTopObjectId("test" + new Random().nextInt(1000));
-        alarmInfo.setTopObjectName("test" + new Random().nextInt(1000));
-        alarmInfo.setTopObjectResName("test" + new Random().nextInt(1000));
+        alarmInfo.setFirstOccurTime(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
+        alarmInfo.setCauseId(alarmDataTest.getSpecificProblemId());
+        alarmInfo.setCauseName(alarmDataTest.getSpecificProblem());
+        alarmInfo.setObjectId(CommonUtil.getRandom(4));
+        alarmInfo.setObjectName("test" + CommonUtil.getRandom(3));
+        alarmInfo.setResName("test" +  CommonUtil.getRandom(3));
+        alarmInfo.setTopObjectId(CommonUtil.getRandom(4));
+        alarmInfo.setTopObjectName("test" + CommonUtil.getRandom(3));
+        alarmInfo.setTopObjectResName("test" + CommonUtil.getRandom(3));
         alarmInfo.setResId(107001000000000L);
-        alarmInfo.setTopObjectUserLabel("test" + new Random().nextInt(1000));
+        alarmInfo.setTopObjectUserLabel("test" + CommonUtil.getRandom(3));
         alarmInfo.setTopObjectResId(107001000000000L);
-        alarmInfo.setDepartmentId(new Random().nextInt(1000));
-        alarmInfo.setDepartmentName("test" + new Random().nextInt(1000));
-        alarmInfo.setDictAlarmLevelName("test" + new Random().nextInt(1000));
-        alarmInfo.setDictAlarmSourceValue(new Random().nextInt(1000));
-        alarmInfo.setDictAlarmSourceName("test" + new Random().nextInt(1000));
-        alarmInfo.setOccurCount(new Random().nextInt(1000));
+        alarmInfo.setDepartmentId(Integer.valueOf(CommonUtil.getRandom(4)));
+        alarmInfo.setDepartmentName("test" + CommonUtil.getRandom(3));
+        alarmInfo.setDictAlarmLevelName("test" + CommonUtil.getRandom(3));
+        alarmInfo.setDictAlarmSourceValue(Integer.valueOf(CommonUtil.getRandom(4)));
+        alarmInfo.setDictAlarmSourceName("test" + CommonUtil.getRandom(3));
+        alarmInfo.setOccurCount(Integer.valueOf(CommonUtil.getRandom(4)));
         alarmInfo.setLastUpdateTime(new Date());
         alarmInfo.setLastOccurTime(new Date());
-        alarmInfo.setDictAlarmClearName("test" + new Random().nextInt(1000));
+        alarmInfo.setDictAlarmClearName("test" + CommonUtil.getRandom(3));
         alarmInfo.setClearTime(new Date());
-        alarmInfo.setDictAlarmAckName("test" + new Random().nextInt(1000));
+        alarmInfo.setDictAlarmAckName("test" + CommonUtil.getRandom(3));
         alarmInfo.setAckTime(new Date());
-        alarmInfo.setObjectUserLabel("test" + new Random().nextInt(1000));
-        alarmInfoRespository.save(alarmInfo);
+        alarmInfo.setObjectUserLabel("test" + CommonUtil.getRandom(3));
+        alarmInfo.setAlarmId(alarmDataTest.getAlarmId());
 
         alarmInfoCusin.setAlarmSeq(alarmDataTest.getAlarmSeq());
-        alarmInfoCusin.setAlarmType(alarmDataTest.getAlarmType() + new Random().nextInt(100));
+        alarmInfoCusin.setAlarmType(alarmDataTest.getAlarmType());
         alarmInfoCusin.setOmcReceivedTime(new SimpleDateFormat("yyyy-MM-dd  HH:mm:ss").format(new Date()));
-        alarmInfoCusin.setAlarmId(alarmDataTest.getAlarmId() + new Random().nextInt(100));
-        alarmInfoCusin.setOmcUid(alarmDataTest.getOmcUID() + new Random().nextInt(100));
-        alarmInfoCusin.setLocationInfo(alarmDataTest.getLocationInfo() + new Random().nextInt(100));
-        alarmInfoCusin.setESerialNum(alarmDataTest.getESerialNum() + new Random().nextInt(100));
-        alarmInfoCusin.setAddInfo(alarmDataTest.getAddInfo() + new Random().nextInt(100));
-        alarmInfoCusin.setRNeUID(alarmDataTest.getRNeUID() + new Random().nextInt(100));
-        alarmInfoCusin.setRNeName(alarmDataTest.getRNeName() + new Random().nextInt(100));
-        alarmInfoCusin.setRNeType(alarmDataTest.getRNeType() + new Random().nextInt(100));
+        alarmInfoCusin.setAlarmId(alarmDataTest.getAlarmId());
+        alarmInfoCusin.setOmcUid(alarmDataTest.getOmcUID());
+        alarmInfoCusin.setLocationInfo(alarmDataTest.getLocationInfo());
+        alarmInfoCusin.setESerialNum(alarmDataTest.getESerialNum());
+        alarmInfoCusin.setAddInfo(alarmDataTest.getAddInfo());
+        alarmInfoCusin.setRNeUID(alarmDataTest.getRNeUID());
+        alarmInfoCusin.setRNeName(alarmDataTest.getRNeName());
+        alarmInfoCusin.setRNeType(alarmDataTest.getRNeType());
         alarmInfoCusin.setNeUID(alarmDataTest.getNeUID());
-        alarmInfoCusin.setNeName(alarmDataTest.getNeName() + new Random().nextInt(100));
-        alarmInfoCusin.setNeType(alarmDataTest.getNeType() + new Random().nextInt(100));
+        alarmInfoCusin.setNeName(alarmDataTest.getNeName());
+        alarmInfoCusin.setNeType(alarmDataTest.getNeType());
         alarmInfoCusin.setObjectUID(alarmDataTest.getObjectUID());
-        alarmInfoCusin.setObjectName(alarmDataTest.getObjectName() + new Random().nextInt(100));
-        alarmInfoCusin.setObjetType(alarmDataTest.getObjectType() + new Random().nextInt(100));
-        alarmInfoCusinRepository.save(alarmInfoCusin);
+        alarmInfoCusin.setObjectName(alarmDataTest.getObjectName());
+        alarmInfoCusin.setObjetType(alarmDataTest.getObjectType());
+
+        alarmInfos.add(alarmInfo);
+        alarmInfoCusins.add(alarmInfoCusin);
+
+        if (alarmInfos.size() == 100){
+            alarmInfoCusinRepository.saveAll(alarmInfoCusins);
+            alarmInfoRespository.saveAll(alarmInfos);
+
+            alarmInfos.clear();
+            alarmInfoCusins.clear();
+        }
     }
 }

@@ -1,86 +1,87 @@
-package socket.task;
+package com.wisdombud.alarmmgr.collection.socket;
 
+import com.wisdombud.alarmmgr.collection.domain.socketClient.SocketServerInfo;
+import com.wisdombud.alarmmgr.collection.service.SocketClientService;
+import com.wisdombud.alarmmgr.collection.service.SocketServerInfoService;
+import com.wisdombud.alarmmgr.collection.service.SocketServerService;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Component;
-import socket.SocketServerInfo;
-import socket.client.SocketClientService;
-import socket.server.SocketServerService;
-import socket.service.SocketServerInfoService;
+import org.springframework.scheduling.annotation.Scheduled;
 
+import java.io.DataInputStream;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.net.Socket;
+import java.util.Date;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+/**
+ * created by zsl
+ */
 
 @Component
 public class SocketTask {
 
-    //ExecutorService executorServiceServer = Executors.newFixedThreadPool(5);
-    ExecutorService executorServiceClient = Executors.newFixedThreadPool(5);
-    /*public static void main(String[] args) {
-        //线程池
-
-        Runnable runnable = new Runnable() {
-            @Override
-            public void run() {
-            Socket socket = null;
-            try {
-                //和服务端建立链接
-                socket = new Socket(socketServerInfo.getHost(),socketServerInfo.getPort());
-                //登录请求消息
-                String msg = "reqLoginAlarm;" + "user=" + socketServerInfo.getUser() + ";" + "key=" + socketServerInfo.getKey()+ ";" + "type=msg" ;
-                //客户端发送接收消息
-                socketclientservice.receiveAlarmData(msg,socket);
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-            }
-        };
-        executorService.submit(runnable);
-        executorService.shutdown();
-    }*/
-
+    ExecutorService executorServiceClient = Executors.newFixedThreadPool(10);
 
     @Autowired
-    private SocketServerInfoService socketServerInfoService;
+    SocketServerInfoService socketServerInfoService;
     @Autowired
-    private SocketServerService socketServerService;
+    SocketServerService socketServerService;
     @Autowired
-    private SocketClientService socketclientservice;
+    SocketClientService socketclientservice;
+    @Autowired
+    RedisTemplate<String,String> redisTemplate;
 
     //服务端
     @Scheduled(initialDelay = 5000, fixedRate = 1000 * 60 * 60 * 24 * 666)
-    public void getSocketServerInfo() {
-        //socketServerService.start(9048);
-        socketServerService.start(8047);
+    public void getSocketServerInfo() throws Exception{
+        //---- 8047 ----9047 9048 192.168.160.49
+        socketServerService.start(9048,1);
     }
 
     //客户端启动
-    @Scheduled(initialDelay = 10000, fixedRate = 1000 * 60 * 60 * 24 * 666)
+    @Scheduled(initialDelay = 10000, fixedRate = 1000 * 60 * 1)
     public void startClient() {
+        System.out.println("------启动客户端定时任务-------");
         //获取ip，port
         List<SocketServerInfo> allServerInfo = socketServerInfoService.getAllServerInfo();
-        //每有一个服务器，客户端开启一个线程去链接，互不影响
-        for (final SocketServerInfo socketServerInfo : allServerInfo) {
-            Runnable runnable = new Runnable() {
-                @Override
-                public void run() {
-                    Socket socket = null;
-                    try {
-                        //和服务端建立链接
-                        socket = new Socket(socketServerInfo.getHost(), socketServerInfo.getPort());
-                        //登录请求消息
-                        String msg = "reqLoginAlarm;" + "user=" + socketServerInfo.getUser() + ";" + "key=" + socketServerInfo.getKey() + ";" + "type=msg";
-                        //客户端发送接收消息
-                        socketclientservice.receiveAlarmData(msg, socket);
-                    } catch (Exception e) {
-                        e.printStackTrace();
+        if (allServerInfo.size() != 0) {
+            //每有一个服务器，客户端开启一个线程去链接，互不影响
+            for (SocketServerInfo socketServerInfo : allServerInfo) {
+                //判断状态是否为离线
+                if (socketServerInfo.getStatus() == 0) {
+                    String s = redisTemplate.boundValueOps( socketServerInfo.getUniqueKey()+"02").get();
+                    //判断redis开关状态是否为在线
+                    if (s.equals("1")) {
+                        Runnable runnable = new Runnable() {
+                            @Override
+                            public void run() {
+                                Socket socket = null;
+
+                                try {
+                                    //建立链接
+                                    socket = new Socket(socketServerInfo.getHost(), socketServerInfo.getPort());
+                                    socketServerInfoService.update(socketServerInfo.getId());
+                                    //登录请求消息
+                                    String msg = "reqLoginAlarm;" + "user=" + socketServerInfo.getUser() + ";" + "key=" + socketServerInfo.getKey() + ";" + "type=msg";
+                                    //客户端发送接收消息
+                                    socketclientservice.receiveAlarmData(msg, socket,socketServerInfo);
+
+                                } catch (Exception e) {
+                                    e.printStackTrace();
+                                }
+                            }
+                        };
+                        executorServiceClient.submit(runnable);
                     }
                 }
-            };
-            executorServiceClient.submit(runnable);
+            }
+            //executorServiceClient.shutdown();
         }
-        executorServiceClient.shutdown();
     }
 }
